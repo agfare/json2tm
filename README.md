@@ -12,8 +12,9 @@ Convert JSON translation files (EN / DE / RU) into **TMX** and **XLSX** translat
 - Deduplicates segments globally across all processed files
 - Validates JSON structure, UUID field format, and translation field types before extraction
 - Warns on structural mismatches between language files (missing keys, array length differences)
+- Runs 7 translation quality checks per segment pair and flags or excludes bad segments
 - Live progress bars for extraction and output writing (requires `tqdm`)
-- Prints a full processing summary: files loaded, segments created, duplicates skipped, errors
+- Prints a full processing summary: files loaded, segments created, duplicates skipped, QA issues, errors
 
 ---
 
@@ -132,6 +133,20 @@ data/
 
 Files are matched by relative path: `en/subspecialties/neurology.json` → `de/subspecialties/neurology.json` → `ru/subspecialties/neurology.json`. Missing counterparts are reported as load failures but do not stop the rest of the run.
 
+### Strict mode (clean output only)
+
+Add `--strict` to exclude any segment that fails a QA check from the TMX and XLSX output:
+
+```bash
+python json2tm.py \
+  --en data/en/ \
+  --de data/de/ \
+  --ru data/ru/ \
+  --strict
+```
+
+Without `--strict` all segments are written and QA issues are visible in the XLSX **QA Issues** column. With `--strict` only segments that pass all checks are written.
+
 ---
 
 ## Flags
@@ -142,6 +157,7 @@ Files are matched by relative path: `en/subspecialties/neurology.json` → `de/s
 | `--de FILE/DIR` | Yes | — | German target file or directory |
 | `--ru FILE/DIR` | Yes | — | Russian target file or directory |
 | `--out DIR` | No | `output/` | Output directory |
+| `--strict` | No | off | Exclude segments that fail any QA check from all output |
 | `--same-keys` | No | off | Use when all three files share the same field names (e.g. all use `label_en`) and the text values differ per language |
 | `--no-tmx` | No | off | Skip TMX output |
 | `--no-xlsx` | No | off | Skip XLSX output |
@@ -186,14 +202,20 @@ Each file contains only clean `<tu>` / `<tuv>` / `<seg>` elements with no metada
 | Sheet | Content |
 |-------|---------|
 | **Summary** | Total segments, EN→DE count, EN→RU count, generation timestamp |
-| **EN-DE** | Row per segment: `#`, Segment ID, EN source, DE target, Context UUID, JSON path |
+| **EN-DE** | Row per segment: `#`, Segment ID, EN source, DE target, Context UUID, JSON path, QA issues |
 | **EN-RU** | Same layout for EN→RU pairs |
 
-Rows with a missing translation are highlighted in red.
+Row highlighting in the translation sheets:
+
+| Colour | Meaning |
+|--------|---------|
+| Red | Segment has at least one QA error |
+| Amber | Segment has QA warnings only |
+| None | Segment is clean |
 
 ---
 
-## Validation
+## Structural validation
 
 Before extraction the script runs the following checks on each file:
 
@@ -207,7 +229,27 @@ Before extraction the script runs the following checks on each file:
 | Array length mismatch between EN and DE/RU at the same path | Warning |
 | Missing DE or RU translation for an EN source field | Warning |
 
-Errors cause the affected triplet to be skipped. Warnings are collected and printed in the summary but do not stop processing.
+Structural errors cause the affected file triplet to be skipped. Warnings are collected and printed in the summary but do not stop processing.
+
+---
+
+## QA checks
+
+After deduplication, every extracted segment pair is checked for translation quality. QA runs separately for each language pair (EN→DE and EN→RU).
+
+| Code | Level | Description |
+|------|-------|-------------|
+| `UNTRANSLATED` | Warning | Target text is identical to the source. Only applied to strings longer than 5 characters that contain lowercase letters, so short abbreviations (OK, DNA, MRI) are not flagged. |
+| `LENGTH_RATIO` | Warning | The character-count ratio between target and source is outside the expected range. Thresholds: EN→DE 0.25–4.0×, EN→RU 0.20–5.0×. Only applied to strings of 10 or more characters. |
+| `NUMBER_MISMATCH` | Error | Digit sequences present in the source are absent from, or changed in, the target — or extra digits appear in the target. |
+| `PLACEHOLDER_MISMATCH` | Error | Interpolation markers (`{var}`, `{{var}}`, `%s`, `%d`, `%(name)s`, etc.) differ between source and target. |
+| `NO_CYRILLIC` | Warning | The Russian target contains no Cyrillic characters, despite the source containing lowercase Latin letters. |
+| `WRONG_SCRIPT` | Warning | The German target contains Cyrillic characters, suggesting the file may be mislabelled or swapped. |
+| `TAG_MISMATCH` | Error | HTML or XML tags present in the source are absent from or different in the target. |
+
+**Without `--strict`** all segments are included in the output. QA issues are recorded in the **QA Issues** column of the XLSX file and counted in the processing summary.
+
+**With `--strict`** any segment that has at least one QA issue (error or warning) is excluded from the TMX and XLSX output entirely. The count of excluded segments is shown in the summary.
 
 ---
 
@@ -250,6 +292,10 @@ In this mode the value of every `*_en` / `*En` field is read from each respectiv
 ── Deduplicating ────────────────────────────────────────────
   308 duplicates removed → 4,906 unique segments
 
+── QA checks ────────────────────────────────────────────────
+  ⚠  143 issue(s) found
+  4,906 segments ready for output
+
 ── Writing TMX ──────────────────────────────────────────────
   ✓  en-de.tmx  (4,906 TUs, 1,204.3 KB)
   ✓  en-ru.tmx  (4,906 TUs, 1,318.7 KB)
@@ -267,8 +313,12 @@ In this mode the value of every `*_en` / `*En` field is read from each respectiv
   Segments created:              4,906
   Skipped — duplicate:           308
   Skipped — null/empty:          147
-  Errors:                        0
-  Warnings:                      0
+────────────────────────────────────────────────────────────
+  QA issues found:               143
+    excluded (--strict):         0
+────────────────────────────────────────────────────────────
+  Struct errors:                 0
+  Struct warnings:               0
 ════════════════════════════════════════════════════════════
 ```
 
@@ -278,5 +328,5 @@ In this mode the value of every `*_en` / `*En` field is read from each respectiv
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success (warnings do not affect exit code) |
-| `1` | One or more errors were encountered |
+| `0` | Success (QA issues and warnings do not affect exit code) |
+| `1` | One or more structural errors were encountered |

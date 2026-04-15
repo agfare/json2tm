@@ -47,9 +47,10 @@ import hashlib
 import json
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, NamedTuple
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
@@ -104,6 +105,21 @@ LANGS = {
     "ru": ("_ru", "Ru", "ru"),
 }
 
+# ── QA patterns ───────────────────────────────────────────────────────────────
+
+# Interpolation placeholders: {var}, {{var}}, %s, %d, %(name)s, etc.
+_PH_RE       = re.compile(r'%[sdif%]|%\(\w+\)[sdif]|\{\{?[\w. ]+\}?\}')
+_NUM_RE      = re.compile(r'\d+')
+_TAG_RE      = re.compile(r'<[a-zA-Z/][^>]*>')
+_CYRILLIC_RE = re.compile(r'[\u0400-\u04FF]')
+_LATIN_LC_RE = re.compile(r'[a-z]')
+
+
+class QAIssue(NamedTuple):
+    level: str   # "error" | "warning"
+    code:  str   # short identifier, e.g. "UNTRANSLATED"
+    msg:   str   # human-readable detail
+
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -116,6 +132,9 @@ class Stats:
         self.skipped_null:         int       = 0
         self.errors:               list[str] = []
         self.warnings:             list[str] = []
+        # QA
+        self.qa_flagged:           int       = 0   # segments with ≥1 QA issue
+        self.qa_excluded:          int       = 0   # removed by --strict
 
     # ---- helpers ----
 
@@ -138,15 +157,19 @@ class Stats:
             SEP,
             f"  {'PROCESSING SUMMARY':^{W - 4}}",
             SEP,
-            row("Files processed:",      self.files_ok + self.files_fail),
-            row(f"  {ok_sym}  loaded OK:",  self.files_ok),
-            row(  "  ✗  load failures:",  self.files_fail),
+            row("Files processed:",        self.files_ok + self.files_fail),
+            row(f"  {ok_sym}  loaded OK:", self.files_ok),
+            row(  "  ✗  load failures:",   self.files_fail),
             THN,
-            row("Segments created:",     self.segments_created),
-            row("Skipped — duplicate:",  self.skipped_dup),
-            row("Skipped — null/empty:", self.skipped_null),
-            row("Errors:",               len(self.errors)),
-            row("Warnings:",             len(self.warnings)),
+            row("Segments created:",       self.segments_created),
+            row("Skipped — duplicate:",    self.skipped_dup),
+            row("Skipped — null/empty:",   self.skipped_null),
+            THN,
+            row("QA issues found:",        self.qa_flagged),
+            row("  excluded (--strict):",  self.qa_excluded),
+            THN,
+            row("Struct errors:",          len(self.errors)),
+            row("Struct warnings:",        len(self.warnings)),
         ]
 
         def _list(header: str, items: list[str]) -> None:
@@ -157,10 +180,10 @@ class Stats:
             for msg in items[:30]:
                 lines.append(f"    • {msg}")
             if len(items) > 30:
-                lines.append(f"    … and {len(items) - 30} more (see log)")
+                lines.append(f"    … and {len(items) - 30} more")
 
-        _list("Errors:",   self.errors)
-        _list("Warnings:", self.warnings)
+        _list("Structural errors:",   self.errors)
+        _list("Structural warnings:", self.warnings)
         lines.append(SEP)
         print("\n".join(lines))
 
@@ -243,7 +266,7 @@ def lint(node: Any, path: str, stats: Stats) -> None:
 
 class Segment:
     """A matched EN → DE / RU translation unit."""
-    __slots__ = ("path", "ctx_uuid", "en", "de", "ru")
+    __slots__ = ("path", "ctx_uuid", "en", "de", "ru", "qa_de", "qa_ru")
 
     def __init__(
         self,
@@ -258,6 +281,8 @@ class Segment:
         self.en       = en
         self.de       = de
         self.ru       = ru
+        self.qa_de: list[QAIssue] = []
+        self.qa_ru: list[QAIssue] = []
 
 
 # ── Parallel tree walk ────────────────────────────────────────────────────────
@@ -463,6 +488,136 @@ def seg_id(en_text: str) -> str:
     return hashlib.md5(en_text.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
+# ── QA checks ─────────────────────────────────────────────────────────────────
+
+def qa_check_pair(en: str, tgt: str, tgt_lang: str, path: str) -> list[QAIssue]:
+    """
+    Run all QA checks on one EN→target pair.  Returns a (possibly empty)
+    list of QAIssue named tuples.
+
+    Checks
+    ------
+    UNTRANSLATED      (warning)  Target text is identical to source.
+    LENGTH_RATIO      (warning)  Character-count ratio is outside expected bounds.
+    NUMBER_MISMATCH   (error)    Digit sequences present in EN are absent/changed
+                                 in the target, or extra digits appear.
+    PLACEHOLDER_MISMATCH (error) Interpolation markers ({var}, %s, …) differ.
+    NO_CYRILLIC       (warning)  RU translation contains no Cyrillic characters.
+    WRONG_SCRIPT      (warning)  DE translation contains Cyrillic characters
+                                 (likely a swapped or mislabelled file).
+    TAG_MISMATCH      (error)    HTML/XML tags present in EN differ in target.
+    """
+    issues: list[QAIssue] = []
+
+    # 1. Untranslated — target identical to source
+    #    Skip short strings and pure-uppercase abbreviations (OK, DNA, MRI …)
+    if (
+        len(en) > 5
+        and _LATIN_LC_RE.search(en)
+        and en.strip().lower() == tgt.strip().lower()
+    ):
+        issues.append(QAIssue(
+            "warning", "UNTRANSLATED",
+            f"{path}: target is identical to source — {en!r:.80}",
+        ))
+
+    # 2. Length ratio
+    #    Generous bounds: EN→DE German runs ~30 % longer; EN→RU varies widely.
+    #    Only apply to strings of 10+ chars to avoid false positives on short labels.
+    if len(en) >= 10:
+        ratio = len(tgt) / len(en)
+        lo, hi = (0.25, 4.0) if tgt_lang == "de" else (0.20, 5.0)
+        if not (lo <= ratio <= hi):
+            issues.append(QAIssue(
+                "warning", "LENGTH_RATIO",
+                f"{path}: {tgt_lang.upper()}/EN length ratio {ratio:.2f} "
+                f"(EN={len(en)} chars, {tgt_lang.upper()}={len(tgt)} chars)",
+            ))
+
+    # 3. Number preservation
+    #    Compare multisets of digit runs so "1 234" and "1234" both surface.
+    en_nums  = Counter(_NUM_RE.findall(en))
+    tgt_nums = Counter(_NUM_RE.findall(tgt))
+    missing  = en_nums - tgt_nums
+    extra    = tgt_nums - en_nums
+    if missing or extra:
+        parts = []
+        if missing: parts.append(f"missing {dict(missing)}")
+        if extra:   parts.append(f"extra {dict(extra)}")
+        issues.append(QAIssue(
+            "error", "NUMBER_MISMATCH",
+            f"{path}: numbers differ in {tgt_lang.upper()} — {', '.join(parts)}",
+        ))
+
+    # 4. Placeholder preservation
+    en_ph  = Counter(_PH_RE.findall(en))
+    tgt_ph = Counter(_PH_RE.findall(tgt))
+    if en_ph != tgt_ph:
+        issues.append(QAIssue(
+            "error", "PLACEHOLDER_MISMATCH",
+            f"{path}: placeholders differ — "
+            f"EN {dict(en_ph)}, {tgt_lang.upper()} {dict(tgt_ph)}",
+        ))
+
+    # 5. Cyrillic script check for Russian
+    #    Only flag real prose (source has lowercase Latin); skip abbreviations.
+    if tgt_lang == "ru" and len(en) > 3 and _LATIN_LC_RE.search(en):
+        if not _CYRILLIC_RE.search(tgt):
+            issues.append(QAIssue(
+                "warning", "NO_CYRILLIC",
+                f"{path}: RU target has no Cyrillic — {tgt!r:.80}",
+            ))
+
+    # 6. Wrong script in DE (Cyrillic in a German field → likely swapped file)
+    if tgt_lang == "de" and _CYRILLIC_RE.search(tgt):
+        issues.append(QAIssue(
+            "warning", "WRONG_SCRIPT",
+            f"{path}: DE target contains Cyrillic characters — {tgt!r:.80}",
+        ))
+
+    # 7. HTML / XML tag preservation
+    en_tags  = Counter(_TAG_RE.findall(en))
+    tgt_tags = Counter(_TAG_RE.findall(tgt))
+    if en_tags != tgt_tags:
+        issues.append(QAIssue(
+            "error", "TAG_MISMATCH",
+            f"{path}: HTML tags differ — EN {dict(en_tags)}, "
+            f"{tgt_lang.upper()} {dict(tgt_tags)}",
+        ))
+
+    return issues
+
+
+def run_qa(segments: list[Segment], strict: bool, stats: Stats) -> list[Segment]:
+    """
+    Run QA checks on every segment.  Fills seg.qa_de and seg.qa_ru in-place.
+
+    strict=False  All segments are passed through; issues are counted and
+                  recorded in stats but do not affect the output list.
+    strict=True   Segments that have at least one QA issue (any level) are
+                  excluded from the returned list and counted in stats.qa_excluded.
+    """
+    out: list[Segment] = []
+
+    for seg in segments:
+        if seg.de:
+            seg.qa_de = qa_check_pair(seg.en, seg.de, "de", seg.path)
+        if seg.ru:
+            seg.qa_ru = qa_check_pair(seg.en, seg.ru, "ru", seg.path)
+
+        all_issues = seg.qa_de + seg.qa_ru
+
+        if all_issues:
+            stats.qa_flagged += 1
+
+        if strict and all_issues:
+            stats.qa_excluded += 1
+        else:
+            out.append(seg)
+
+    return out
+
+
 # ── TMX writer ────────────────────────────────────────────────────────────────
 
 def write_tmx(
@@ -519,16 +674,18 @@ def write_tmx(
 
 # ── XLSX writer ───────────────────────────────────────────────────────────────
 
-_HDR_FILL = None
-_HDR_FONT = None
-_WRAP     = None
-_ERR_FILL = None
+_HDR_FILL  = None
+_HDR_FONT  = None
+_WRAP      = None
+_ERR_FILL  = None   # missing translation / QA error
+_WARN_FILL = None   # QA warning
 
 if HAS_OPENPYXL:
-    _HDR_FILL = PatternFill("solid", fgColor="1F4E79")
-    _HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
-    _WRAP     = Alignment(wrap_text=True, vertical="top")
-    _ERR_FILL = PatternFill("solid", fgColor="FFD0D0")
+    _HDR_FILL  = PatternFill("solid", fgColor="1F4E79")
+    _HDR_FONT  = Font(bold=True, color="FFFFFF", size=11)
+    _WRAP      = Alignment(wrap_text=True, vertical="top")
+    _ERR_FILL  = PatternFill("solid", fgColor="FFD0D0")
+    _WARN_FILL = PatternFill("solid", fgColor="FFF3CD")
 
 
 def _apply_header(ws, columns: list[str]) -> None:
@@ -548,25 +705,37 @@ def write_xlsx(segments: list[Segment], out_path: Path, pbar) -> int:
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    col_widths = [6, 14, 50, 50, 36, 55]
-    headers    = ["#", "Segment ID", "EN (source)", "Target", "Context UUID", "JSON path"]
+    col_widths = [6, 14, 50, 50, 36, 55, 40]
+    headers    = ["#", "Segment ID", "EN (source)", "Target",
+                  "Context UUID", "JSON path", "QA issues"]
 
-    def _fill_sheet(ws, tgt_attr: str) -> int:
+    def _fill_sheet(ws, tgt_attr: str, qa_attr: str) -> int:
         _apply_header(ws, headers)
         count = 0
         for seg in segments:
-            tgt: str | None = getattr(seg, tgt_attr)
+            tgt: str | None           = getattr(seg, tgt_attr)
+            issues: list[QAIssue]     = getattr(seg, qa_attr)
             if not tgt:
                 pbar.update(1)
                 continue
             count += 1
             row_idx = count + 1
-            ws.append([count, seg_id(seg.en), seg.en, tgt, seg.ctx_uuid or "", seg.path])
+
+            qa_cell = "; ".join(f"[{i.level.upper()}] {i.code}" for i in issues)
+            ws.append([count, seg_id(seg.en), seg.en, tgt,
+                       seg.ctx_uuid or "", seg.path, qa_cell])
+
             for cell in ws[row_idx]:
                 cell.alignment = _WRAP
-            if not tgt:                          # highlight missing translations
+
+            # Row highlight: error (red) > warning (amber) > clean (none)
+            has_error   = any(i.level == "error"   for i in issues)
+            has_warning = any(i.level == "warning"  for i in issues)
+            fill = _ERR_FILL if has_error else (_WARN_FILL if has_warning else None)
+            if fill:
                 for cell in ws[row_idx]:
-                    cell.fill = _ERR_FILL
+                    cell.fill = fill
+
             pbar.update(1)
         for i, w in enumerate(col_widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
@@ -574,10 +743,10 @@ def write_xlsx(segments: list[Segment], out_path: Path, pbar) -> int:
         return count
 
     ws_de = wb.create_sheet("EN-DE")
-    n_de  = _fill_sheet(ws_de, "de")
+    n_de  = _fill_sheet(ws_de, "de", "qa_de")
 
     ws_ru = wb.create_sheet("EN-RU")
-    n_ru  = _fill_sheet(ws_ru, "ru")
+    n_ru  = _fill_sheet(ws_ru, "ru", "qa_ru")
 
     # Summary sheet (front)
     ws_s = wb.create_sheet("Summary", 0)
@@ -669,6 +838,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--same-keys", action="store_true",
                    help="All three files use identical field names; "
                         "the text values differ per language.")
+    p.add_argument("--strict",    action="store_true",
+                   help="Exclude segments that fail any QA check from all output. "
+                        "Without this flag QA issues are reported but segments are kept.")
     p.add_argument("--no-tmx",    action="store_true",
                    help="Skip TMX output")
     p.add_argument("--no-xlsx",   action="store_true",
@@ -736,10 +908,19 @@ def main() -> None:
     # ── 5. Deduplicate ────────────────────────────────────────────────────────
     print("\n── Deduplicating ────────────────────────────────────────────")
     segments = deduplicate(raw, stats)
-    stats.segments_created = len(segments)
     print(f"  {stats.skipped_dup:,} duplicates removed → {len(segments):,} unique segments")
 
-    # ── 6. Write TMX ──────────────────────────────────────────────────────────
+    # ── 6. QA ─────────────────────────────────────────────────────────────────
+    print("\n── QA checks ────────────────────────────────────────────────")
+    segments = run_qa(segments, strict=args.strict, stats=stats)
+    stats.segments_created = len(segments)
+    qa_sym = "✓" if stats.qa_flagged == 0 else f"⚠  {stats.qa_flagged:,} issue(s) found"
+    print(f"  {qa_sym}")
+    if stats.qa_excluded:
+        print(f"  {stats.qa_excluded:,} segments excluded by --strict")
+    print(f"  {len(segments):,} segments ready for output")
+
+    # ── 8. Write TMX ──────────────────────────────────────────────────────────
     if not args.no_tmx:
         print("\n── Writing TMX ──────────────────────────────────────────────")
         pairs = [("de", "de", "en-de.tmx"), ("ru", "ru", "en-ru.tmx")]
@@ -757,7 +938,7 @@ def main() -> None:
             size_kb = out_path.stat().st_size / 1024
             print(f"  ✓  {fname}  ({n:,} TUs, {size_kb:.1f} KB)")
 
-    # ── 7. Write XLSX ─────────────────────────────────────────────────────────
+    # ── 9. Write XLSX ─────────────────────────────────────────────────────────
     if not args.no_xlsx:
         print("\n── Writing XLSX ─────────────────────────────────────────────")
         xlsx_path = out_dir / "translations.xlsx"
@@ -775,7 +956,7 @@ def main() -> None:
             size_kb = xlsx_path.stat().st_size / 1024
             print(f"  ✓  translations.xlsx  ({n:,} segments, {size_kb:.1f} KB)")
 
-    # ── 8. Summary ────────────────────────────────────────────────────────────
+    # ── 10. Summary ───────────────────────────────────────────────────────────
     stats.report()
     sys.exit(1 if stats.errors else 0)
 
