@@ -4,11 +4,13 @@
 
 `pip install tqdm openpyxl`
 
+```
 python json2tm.py \
   --en translations_en.json \
   --de translations_de.json \
   --ru translations_ru.json \
   --out output/
+```
 
 # Flags
   
