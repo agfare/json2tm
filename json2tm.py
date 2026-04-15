@@ -88,9 +88,9 @@ UUID_KEY_RE = re.compile(r"(?i)(uuid|_id)$")
 
 # Language descriptors: (snake suffix, camelCase suffix, BCP-47 tag)
 LANGS = {
-    "en": ("_en", "En", "en-US"),
-    "de": ("_de", "De", "de-DE"),
-    "ru": ("_ru", "Ru", "ru-RU"),
+    "en": ("_en", "En", "en"),
+    "de": ("_de", "De", "de"),
+    "ru": ("_ru", "Ru", "ru"),
 }
 
 
@@ -469,7 +469,7 @@ def write_tmx(
         creationtoolversion=TOOL_VERSION,
         datatype="plaintext",
         segtype="sentence",
-        adminlang="en-US",
+        adminlang="en",
         srclang=src_bcp47,
         **{"o-tmf": TOOL_NAME},
     )
@@ -666,8 +666,8 @@ def main() -> None:
     # ── 6. Write TMX ──────────────────────────────────────────────────────────
     if not args.no_tmx:
         print("\n── Writing TMX ──────────────────────────────────────────────")
-        pairs = [("de-DE", "de", "en-de.tmx"), ("ru-RU", "ru", "en-ru.tmx")]
-        for bcp47, attr, fname in pairs:
+        pairs = [("de", "de", "en-de.tmx"), ("ru", "ru", "en-ru.tmx")]
+        for lang, attr, fname in pairs:
             out_path = out_dir / fname
             with _tqdm_cls(
                 total=len(segments),
@@ -677,7 +677,7 @@ def main() -> None:
                 colour="green",
                 disable=not HAS_TQDM,
             ) as pbar:
-                n = write_tmx(segments, "en-US", bcp47, attr, out_path, pbar)
+                n = write_tmx(segments, "en", lang, attr, out_path, pbar)
             size_kb = out_path.stat().st_size / 1024
             print(f"  ✓  {fname}  ({n:,} TUs, {size_kb:.1f} KB)")
 
