@@ -159,6 +159,7 @@ Without `--strict` all segments are written and QA issues are visible in the XLS
 | `--out DIR` | No | `output/` | Output directory |
 | `--strict` | No | off | Exclude segments that fail any QA check from all output |
 | `--same-keys` | No | off | Use when all three files share the same field names (e.g. all use `label_en`) and the text values differ per language |
+| `--text-fields FIELD[,...]` | No | — | Comma-separated plain field names (no language suffix) whose values are translatable; matched across files by JSON path |
 | `--no-tmx` | No | off | Skip TMX output |
 | `--no-xlsx` | No | off | Skip XLSX output |
 
@@ -270,6 +271,45 @@ python json2tm.py --en en.json --de de.json --ru ru.json --same-keys
 ```
 
 In this mode the value of every `*_en` / `*En` field is read from each respective file as-is.
+
+---
+
+## `--text-fields` mode
+
+By default the script only extracts fields that carry an explicit language suffix
+(`label_en`, `labelEn`, etc.).  Some JSON structures also contain **plain-name fields** — fields
+with no language tag in their name — where the text value simply differs between the EN, DE and RU
+files at the same JSON path.  Common examples: `categoryName`, `pathologyName`,
+`pathology_type_name`.
+
+Pass `--text-fields` with a comma-separated list of those field names to include them in the
+output:
+
+```bash
+python json2tm.py \
+  --en data/en/ --de data/de/ --ru data/ru/ \
+  --text-fields categoryName,pathology_name,pathology_type_name
+```
+
+**How matching works**
+
+The script walks all three JSON trees simultaneously (lock-step by structure).  When it reaches
+a dict that contains one of the listed field names, it reads:
+
+- the EN value from the EN file's dict
+- the DE value from the DE file's dict at the **same JSON path**
+- the RU value from the RU file's dict at the **same JSON path**
+
+A UUID found in the same enclosing object is captured as the segment's **Context UUID** in the
+XLSX output — confirming that the three dicts represent the same record.
+
+**When to use it vs. `--same-keys`**
+
+| Scenario | Flag to use |
+|----------|-------------|
+| All fields use `*_en` / `*En` names; the DE file has the same names but with German text | `--same-keys` |
+| Some fields have no language suffix at all (`categoryName`, etc.) and you want only those specific fields extracted | `--text-fields categoryName,...` |
+| Both situations apply to different fields in the same files | Use both flags together |
 
 ---
 

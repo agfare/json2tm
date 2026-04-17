@@ -317,15 +317,16 @@ def _peer_key(en_key: str, tgt_lang: str) -> str:
 
 
 def _walk(
-    en_node:    Any,
-    de_node:    Any,
-    ru_node:    Any,
-    path:       str,
-    ctx_uuid:   str | None,
-    same_keys:  bool,
-    stats:      Stats,
+    en_node:     Any,
+    de_node:     Any,
+    ru_node:     Any,
+    path:        str,
+    ctx_uuid:    str | None,
+    same_keys:   bool,
+    stats:       Stats,
     pbar,
-    out:        list[Segment],
+    out:         list[Segment],
+    text_fields: set[str] = frozenset(),
 ) -> None:
     """
     Recursively walk all three trees in lock-step.
@@ -403,6 +404,30 @@ def _walk(
                 out.append(Segment(cpath, uuid, en_text, de_text, ru_text))
                 pbar.update(1)
 
+            elif key in text_fields:
+                # ── Plain-name translatable field (no language suffix) ─────
+                # Value is read from each language file at the same JSON path.
+                # The UUID in the enclosing object confirms alignment.
+                en_text = str(en_val).strip() if isinstance(en_val, str) and en_val else None
+
+                if not en_text:
+                    stats.skipped_null += 1
+                    pbar.update(1)
+                    continue
+
+                de_raw  = de_d.get(key)
+                ru_raw  = ru_d.get(key)
+                de_text = str(de_raw).strip() if isinstance(de_raw, str) and de_raw else None
+                ru_text = str(ru_raw).strip() if isinstance(ru_raw, str) and ru_raw else None
+
+                if de_text is None:
+                    stats.warn(f"No DE translation for text-field {cpath!r}")
+                if ru_text is None:
+                    stats.warn(f"No RU translation for text-field {cpath!r}")
+
+                out.append(Segment(cpath, uuid, en_text, de_text, ru_text))
+                pbar.update(1)
+
             elif not _is_de_key(key) and not _is_ru_key(key):
                 # Recurse into structural (non-language) fields only
                 _walk(
@@ -415,6 +440,7 @@ def _walk(
                     stats,
                     pbar,
                     out,
+                    text_fields,
                 )
 
     elif isinstance(en_node, list):
@@ -441,22 +467,25 @@ def _walk(
                 stats,
                 pbar,
                 out,
+                text_fields,
             )
 
 
 # ── Pre-count (for a meaningful progress bar) ─────────────────────────────────
 
-def _count_en_fields(node: Any) -> int:
+def _count_en_fields(node: Any, text_fields: set[str] = frozenset()) -> int:
     if isinstance(node, dict):
         total = 0
         for key, val in node.items():
             if _is_en_key(key):
                 total += 1
+            elif key in text_fields and isinstance(val, str) and val.strip():
+                total += 1
             elif not _is_de_key(key) and not _is_ru_key(key):
-                total += _count_en_fields(val)
+                total += _count_en_fields(val, text_fields)
         return total
     if isinstance(node, list):
-        return sum(_count_en_fields(item) for item in node)
+        return sum(_count_en_fields(item, text_fields) for item in node)
     return 0
 
 
@@ -841,6 +870,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict",    action="store_true",
                    help="Exclude segments that fail any QA check from all output. "
                         "Without this flag QA issues are reported but segments are kept.")
+    p.add_argument("--text-fields", default="", metavar="FIELD[,FIELD,...]",
+                   help="Comma-separated list of plain (non-language-suffixed) field names "
+                        "whose values are translatable text.  The same field name must exist "
+                        "in all three language files; each file holds the text in its own "
+                        "language.  Example: --text-fields categoryName,pathology_name")
     p.add_argument("--no-tmx",    action="store_true",
                    help="Skip TMX output")
     p.add_argument("--no-xlsx",   action="store_true",
@@ -853,6 +887,11 @@ def main() -> None:
     stats   = Stats()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    text_fields: set[str] = (
+        {f.strip() for f in args.text_fields.split(",") if f.strip()}
+        if args.text_fields else set()
+    )
 
     # ── 1. Resolve file triplets ──────────────────────────────────────────────
     triplets = resolve_triplets(Path(args.en), Path(args.de), Path(args.ru))
@@ -887,7 +926,7 @@ def main() -> None:
             print(f"  {prefix} lint [{label}]  {sym}")
 
         # Extract
-        total_en = _count_en_fields(en_data)
+        total_en = _count_en_fields(en_data, text_fields)
         with _tqdm_cls(
             total=total_en,
             desc=f"  {prefix} extracting",
@@ -896,7 +935,8 @@ def main() -> None:
             colour="cyan",
             disable=not HAS_TQDM,
         ) as pbar:
-            _walk(en_data, de_data, ru_data, "", None, args.same_keys, stats, pbar, raw)
+            _walk(en_data, de_data, ru_data, "", None, args.same_keys, stats, pbar, raw,
+                  text_fields)
 
     if not raw:
         print("\nNo segments extracted. Aborting.")
