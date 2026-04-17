@@ -105,6 +105,13 @@ LANGS = {
     "ru": ("_ru", "Ru", "ru"),
 }
 
+# ── Text helpers ──────────────────────────────────────────────────────────────
+
+def _clean_text(s: str) -> str:
+    """Strip whitespace and leading BOM characters (U+FEFF) from a text value."""
+    return s.strip().lstrip('\ufeff')
+
+
 # ── QA patterns ───────────────────────────────────────────────────────────────
 
 # Interpolation placeholders: {var}, {{var}}, %s, %d, %(name)s, etc.
@@ -113,6 +120,17 @@ _NUM_RE      = re.compile(r'\d+')
 _TAG_RE      = re.compile(r'<[a-zA-Z/][^>]*>')
 _CYRILLIC_RE = re.compile(r'[\u0400-\u04FF]')
 _LATIN_LC_RE = re.compile(r'[a-z]')
+
+# For TAG_MISMATCH: normalise tag attributes away so that <d=Holotopy> and
+# <d=Голотопия> both compare as <d>, avoiding false positives on translated
+# section labels.  Captures the tag name only (with optional leading /).
+_TAG_NAME_RE = re.compile(r'^<(/?[a-zA-Z]+)')
+
+
+def _strip_tag_attrs(tag: str) -> str:
+    """Normalise a tag to its name: ``<d=Holotopy>`` → ``<d>``, ``<color=#6F6F6F>`` → ``<color>``."""
+    m = _TAG_NAME_RE.match(tag)
+    return f"<{m.group(1)}>" if m else tag
 
 
 class QAIssue(NamedTuple):
@@ -190,6 +208,65 @@ class Stats:
 
 # ── JSON loading ──────────────────────────────────────────────────────────────
 
+def _repair_json(text: str) -> str:
+    """
+    Fix unescaped double-quote characters inside JSON string values.
+
+    Some source files use ``""text""`` as a typographic quoting convention.
+    This scanner identifies which quotes are structural (open/close a JSON
+    string) vs. typographic (embedded in text), and escapes the latter as \\".
+
+    A ``"`` is treated as structural (end-of-string) when the next
+    non-whitespace character after it is a JSON delimiter: ``,``, ``}``,
+    ``]``, ``:``, or end of input.  Any other ``"`` found inside an open
+    string is written as ``\\"``.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+
+    while i < n:
+        c = text[i]
+
+        if not in_string:
+            out.append(c)
+            if c == '"':
+                in_string = True
+            i += 1
+            continue
+
+        # ── Inside a string ──────────────────────────────────────────────
+        if c == '\\':
+            # Escaped sequence — copy both characters verbatim
+            out.append(c)
+            i += 1
+            if i < n:
+                out.append(text[i])
+                i += 1
+            continue
+
+        if c == '"':
+            # Peek at the next non-whitespace character to decide:
+            # structural closing quote, or unescaped typographic quote?
+            j = i + 1
+            while j < n and text[j] in ' \t\r\n':
+                j += 1
+            next_ch = text[j] if j < n else ''
+            if next_ch in (',', '}', ']', ':') or j >= n:
+                out.append('"')        # real end of string
+                in_string = False
+            else:
+                out.append('\\"')      # unescaped internal quote — escape it
+            i += 1
+            continue
+
+        out.append(c)
+        i += 1
+
+    return ''.join(out)
+
+
 def load_json(path: Path, label: str, stats: Stats) -> Any | None:
     """Load a JSON file; return None and record stats on failure."""
     try:
@@ -200,18 +277,26 @@ def load_json(path: Path, label: str, stats: Stats) -> Any | None:
         return None
 
     try:
-        data = json.loads(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         stats.files_fail += 1
         stats.err(f"[{label}] Encoding error in '{path.name}': {exc}")
         return None
-    except json.JSONDecodeError as exc:
-        stats.files_fail += 1
-        stats.err(
-            f"[{label}] JSON syntax error in '{path.name}' "
-            f"at line {exc.lineno}, col {exc.colno}: {exc.msg}"
-        )
-        return None
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # First attempt failed — try auto-repairing unescaped quotes
+        try:
+            data = json.loads(_repair_json(text))
+            stats.warn(f"[{label}] Auto-repaired unescaped quotes in '{path.name}'")
+        except json.JSONDecodeError as exc2:
+            stats.files_fail += 1
+            stats.err(
+                f"[{label}] JSON syntax error in '{path.name}' "
+                f"at line {exc2.lineno}, col {exc2.colno}: {exc2.msg}"
+            )
+            return None
 
     stats.files_ok += 1
     print(f"  ✓  [{label}] {path.name}  ({len(raw):,} bytes)")
@@ -391,15 +476,15 @@ def _walk(
                     if ru_val is None and ru_key not in ru_d:
                         ru_val = ru_d.get(key)
 
-                en_text = str(en_val).strip() if isinstance(en_val, str) and en_val else None
+                en_text = _clean_text(en_val) if isinstance(en_val, str) and en_val else None
 
                 if not en_text:
                     stats.skipped_null += 1
                     pbar.update(1)
                     continue
 
-                de_text = str(de_val).strip() if isinstance(de_val, str) and de_val else None
-                ru_text = str(ru_val).strip() if isinstance(ru_val, str) and ru_val else None
+                de_text = _clean_text(de_val) if isinstance(de_val, str) and de_val else None
+                ru_text = _clean_text(ru_val) if isinstance(ru_val, str) and ru_val else None
 
                 if "de" in active_langs and de_text is None:
                     stats.warn(f"No DE translation for {cpath!r}")
@@ -413,7 +498,7 @@ def _walk(
                 # ── Plain-name translatable field (no language suffix) ─────
                 # Value is read from each language file at the same JSON path.
                 # The UUID in the enclosing object confirms alignment.
-                en_text = str(en_val).strip() if isinstance(en_val, str) and en_val else None
+                en_text = _clean_text(en_val) if isinstance(en_val, str) and en_val else None
 
                 if not en_text:
                     stats.skipped_null += 1
@@ -422,8 +507,8 @@ def _walk(
 
                 de_raw  = de_d.get(key)
                 ru_raw  = ru_d.get(key)
-                de_text = str(de_raw).strip() if isinstance(de_raw, str) and de_raw else None
-                ru_text = str(ru_raw).strip() if isinstance(ru_raw, str) and ru_raw else None
+                de_text = _clean_text(de_raw) if isinstance(de_raw, str) and de_raw else None
+                ru_text = _clean_text(ru_raw) if isinstance(ru_raw, str) and ru_raw else None
 
                 if "de" in active_langs and de_text is None:
                     stats.warn(f"No DE translation for text-field {cpath!r}")
@@ -612,8 +697,10 @@ def qa_check_pair(en: str, tgt: str, tgt_lang: str, path: str) -> list[QAIssue]:
         ))
 
     # 7. HTML / XML tag preservation
-    en_tags  = Counter(_TAG_RE.findall(en))
-    tgt_tags = Counter(_TAG_RE.findall(tgt))
+    # Tags are normalised to names only (<d=Holotopy> → <d>) so that
+    # translated section labels don't generate spurious mismatches.
+    en_tags  = Counter(_strip_tag_attrs(t) for t in _TAG_RE.findall(en))
+    tgt_tags = Counter(_strip_tag_attrs(t) for t in _TAG_RE.findall(tgt))
     if en_tags != tgt_tags:
         issues.append(QAIssue(
             "error", "TAG_MISMATCH",
